@@ -1,0 +1,75 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# --- dependencies ---
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# --- next.js / build output ---
+/.next/
+/out/
+/build
+/dist
+*.tsbuildinfo
+next-env.d.ts
+
+# --- prisma ---
+# NOTE: prisma/migrations/ IS committed on purpose - it's the DB "template".
+# Only ignore generated client output and local SQLite files.
+/src/generated
+/prisma/generated
+*.db
+*.db-journal
+/prisma/*.sqlite
+
+# --- env & secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+auth-secret.txt
+
+# --- testing / coverage ---
+/coverage
+/test-results
+/playwright-report
+/playwright/.cache
+/blob-report
+
+# --- logs ---
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --- caches ---
+.eslintcache
+.prettiercache
+.turbo
+
+# --- editors / OS ---
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# --- deploy ---
+.vercel
+
+# --- misc / scratch ---
+/tmp
+*.local
+_*.mjs
+

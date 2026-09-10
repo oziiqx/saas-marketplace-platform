@@ -1,0 +1,745 @@
+// ============================================================================
+//  SaaS Marketplace - Prisma schema
+//  PostgreSQL. Money is always stored as integer minor units (cents) + currency.
+//  Timestamps are UTC. Soft-delete via `*Status` enums, not row removal.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ----------------------------------------------------------------------------
+//  Identity & RBAC
+// ----------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  SELLER
+  CUSTOMER
+}
+
+enum UserStatus {
+  ACTIVE
+  PENDING_VERIFICATION
+  SUSPENDED
+  DEACTIVATED
+}
+
+model User {
+  id            String     @id @default(cuid())
+  name          String?
+  email         String     @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?
+  role          Role       @default(CUSTOMER)
+  status        UserStatus @default(ACTIVE)
+
+  // Security center
+  twoFactorEnabled Boolean   @default(false)
+  twoFactorSecret  String?
+  lastLoginAt      DateTime?
+
+  // Billing linkage (provider-agnostic external id)
+  billingCustomerId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts          Account[]
+  sessions          Session[]
+  sellerProfile     SellerProfile?
+  orders            Order[]                  @relation("CustomerOrders")
+  reviews           Review[]
+  subscriptions     Subscription[]
+  invoices          Invoice[]
+  paymentMethods    PaymentMethod[]
+  apiKeys           ApiKey[]
+  apiRequestLogs    ApiRequestLog[]
+  auditLogs         AuditLog[]               @relation("AuditActor")
+  notifications     Notification[]
+  notificationPrefs NotificationPreference[]
+  refundsRequested  Refund[]                 @relation("RefundRequestedBy")
+  refundsProcessed  Refund[]                 @relation("RefundProcessedBy")
+
+  @@index([role])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// --- Auth.js (NextAuth) adapter models --------------------------------------
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  // Active session management (Security Center)
+  ip           String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ----------------------------------------------------------------------------
+//  Marketplace - sellers, catalog, pricing
+// ----------------------------------------------------------------------------
+
+enum SellerStatus {
+  PENDING_REVIEW
+  ACTIVE
+  PAUSED
+  BANNED
+}
+
+model SellerProfile {
+  id           String       @id @default(cuid())
+  userId       String       @unique
+  storeName    String
+  slug         String       @unique
+  bio          String?      @db.Text
+  website      String?
+  supportEmail String?
+  status       SellerStatus @default(PENDING_REVIEW)
+
+  // Platform take rate applied to each sale, 0..1 (e.g. 0.10 == 10%).
+  commissionRate  Decimal @default(0.10) @db.Decimal(4, 3)
+  payoutAccountId String?
+
+  // Denormalised rollups (kept fresh by server actions / jobs)
+  lifetimeRevenueCents BigInt @default(0)
+  lifetimeSales        Int    @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  products   Product[]
+  orderItems OrderItem[]
+
+  @@index([status])
+}
+
+model Category {
+  id       String  @id @default(cuid())
+  name     String  @unique
+  slug     String  @unique
+  parentId String?
+
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  @@index([parentId])
+}
+
+enum ProductStatus {
+  DRAFT
+  IN_REVIEW
+  PUBLISHED
+  ARCHIVED
+}
+
+enum PricingInterval {
+  ONE_TIME
+  MONTH
+  YEAR
+}
+
+model Product {
+  id               String        @id @default(cuid())
+  sellerId         String
+  categoryId       String?
+  name             String
+  slug             String        @unique
+  shortDescription String        @db.VarChar(280)
+  description      String        @db.Text
+  status           ProductStatus @default(DRAFT)
+
+  thumbnailUrl String?
+  galleryUrls  String[] @default([])
+
+  // SEO metadata (Digital Product Builder - step "SEO")
+  seoTitle       String?
+  seoDescription String?  @db.VarChar(320)
+  seoKeywords    String[] @default([])
+  ogImageUrl     String?
+
+  // Denormalised search/sort rollups
+  ratingAverage  Decimal @default(0) @db.Decimal(3, 2)
+  ratingCount    Int     @default(0)
+  salesCount     Int     @default(0)
+  priceFromCents Int     @default(0)
+
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  seller       SellerProfile  @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  category     Category?      @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  pricingTiers PricingTier[]
+  assets       ProductAsset[]
+  reviews      Review[]
+  orderItems   OrderItem[]
+
+  @@index([sellerId])
+  @@index([categoryId])
+  @@index([status])
+  @@index([status, publishedAt])
+  @@index([priceFromCents])
+  @@index([salesCount])
+}
+
+model PricingTier {
+  id          String          @id @default(cuid())
+  productId   String
+  name        String
+  description String?
+  priceCents  Int
+  currency    String          @default("usd")
+  interval    PricingInterval @default(ONE_TIME)
+  trialDays   Int?
+  features    String[]        @default([])
+  isActive    Boolean         @default(true)
+  sortOrder   Int             @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderItems OrderItem[]
+
+  @@index([productId])
+}
+
+model ProductAsset {
+  id            String   @id @default(cuid())
+  productId     String
+  fileName      String
+  fileUrl       String
+  fileSizeBytes BigInt
+  mimeType      String
+  version       String   @default("1.0.0")
+  checksum      String?
+  createdAt     DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+}
+
+model Review {
+  id                 String   @id @default(cuid())
+  productId          String
+  userId             String
+  rating             Int
+  title              String?
+  body               String?  @db.Text
+  isVerifiedPurchase Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, userId])
+  @@index([productId])
+  @@index([rating])
+}
+
+// ----------------------------------------------------------------------------
+//  Commerce - orders, fulfillment, refunds
+// ----------------------------------------------------------------------------
+
+enum PaymentProvider {
+  MOCK
+  STRIPE
+  PAYPAL
+  PAYU
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FULFILLED
+  PARTIALLY_REFUNDED
+  REFUNDED
+  CANCELLED
+  FAILED
+}
+
+model Order {
+  id          String      @id @default(cuid())
+  orderNumber String      @unique
+  customerId  String
+  status      OrderStatus @default(PENDING)
+  currency    String      @default("usd")
+
+  subtotalCents Int
+  taxCents      Int @default(0)
+  discountCents Int @default(0)
+  totalCents    Int
+
+  provider          PaymentProvider @default(MOCK)
+  providerPaymentId String?
+  billingEmail      String
+  billingName       String?
+  billingCountry    String?
+
+  placedAt    DateTime  @default(now())
+  paidAt      DateTime?
+  fulfilledAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  customer User        @relation("CustomerOrders", fields: [customerId], references: [id], onDelete: Cascade)
+  items    OrderItem[]
+  refunds  Refund[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([placedAt])
+  @@index([provider])
+}
+
+enum FulfillmentStatus {
+  PENDING
+  DELIVERED
+  ACCESS_REVOKED
+}
+
+model OrderItem {
+  id            String @id @default(cuid())
+  orderId       String
+  productId     String
+  pricingTierId String
+  sellerId      String
+  quantity      Int    @default(1)
+
+  unitPriceCents  Int
+  totalCents      Int
+  commissionCents Int               @default(0)
+  fulfillment     FulfillmentStatus @default(PENDING)
+  licenseKey      String?
+
+  createdAt DateTime @default(now())
+
+  order       Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product     Product       @relation(fields: [productId], references: [id])
+  pricingTier PricingTier   @relation(fields: [pricingTierId], references: [id])
+  seller      SellerProfile @relation(fields: [sellerId], references: [id])
+  refunds     Refund[]
+
+  @@index([orderId])
+  @@index([productId])
+  @@index([sellerId])
+}
+
+enum RefundStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+  PROCESSED
+}
+
+model Refund {
+  id          String       @id @default(cuid())
+  orderId     String
+  orderItemId String?
+  amountCents Int
+  currency    String       @default("usd")
+  reason      String       @db.Text
+  status      RefundStatus @default(REQUESTED)
+
+  requestedById    String
+  processedById    String?
+  providerRefundId String?
+
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  order       Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderItem   OrderItem? @relation(fields: [orderItemId], references: [id], onDelete: SetNull)
+  requestedBy User       @relation("RefundRequestedBy", fields: [requestedById], references: [id])
+  processedBy User?      @relation("RefundProcessedBy", fields: [processedById], references: [id])
+
+  @@index([orderId])
+  @@index([status])
+}
+
+// ----------------------------------------------------------------------------
+//  Billing - platform subscription plans, invoices, payment methods
+// ----------------------------------------------------------------------------
+
+model Plan {
+  id          String          @id @default(cuid())
+  name        String
+  slug        String          @unique
+  description String
+  priceCents  Int
+  currency    String          @default("usd")
+  interval    PricingInterval @default(MONTH)
+  trialDays   Int             @default(14)
+  features    String[]        @default([])
+  highlight   Boolean         @default(false)
+  isActive    Boolean         @default(true)
+  sortOrder   Int             @default(0)
+
+  // provider price ids, keyed by provider slug
+  providerPriceIds Json @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subscriptions Subscription[]
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+  UNPAID
+}
+
+model Subscription {
+  id                     String             @id @default(cuid())
+  userId                 String
+  planId                 String
+  status                 SubscriptionStatus @default(TRIALING)
+  provider               PaymentProvider    @default(MOCK)
+  providerSubscriptionId String?
+
+  quantity Int @default(1)
+
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  cancelAtPeriodEnd  Boolean   @default(false)
+  trialEndsAt        DateTime?
+  canceledAt         DateTime?
+  endedAt            DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan     Plan      @relation(fields: [planId], references: [id])
+  invoices Invoice[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([currentPeriodEnd])
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  VOID
+  UNCOLLECTIBLE
+}
+
+model Invoice {
+  id             String        @id @default(cuid())
+  number         String        @unique
+  userId         String
+  subscriptionId String?
+  status         InvoiceStatus @default(DRAFT)
+  currency       String        @default("usd")
+
+  subtotalCents   Int
+  taxCents        Int @default(0)
+  totalCents      Int
+  amountPaidCents Int @default(0)
+
+  provider          PaymentProvider @default(MOCK)
+  providerInvoiceId String?
+  hostedUrl         String?
+  pdfUrl            String?
+
+  periodStart DateTime
+  periodEnd   DateTime
+  issuedAt    DateTime  @default(now())
+  dueAt       DateTime?
+  paidAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user         User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscription Subscription?     @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  lineItems    InvoiceLineItem[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([issuedAt])
+}
+
+model InvoiceLineItem {
+  id              String @id @default(cuid())
+  invoiceId       String
+  description     String
+  quantity        Int    @default(1)
+  unitAmountCents Int
+  amountCents     Int
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+model PaymentMethod {
+  id                      String          @id @default(cuid())
+  userId                  String
+  provider                PaymentProvider
+  providerPaymentMethodId String
+  type                    String          @default("card")
+  brand                   String?
+  last4                   String?
+  expMonth                Int?
+  expYear                 Int?
+  isDefault               Boolean         @default(false)
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerPaymentMethodId])
+  @@index([userId])
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+/// Inbound provider webhook events. `(provider, eventId)` unique => idempotency.
+model WebhookEvent {
+  id        String          @id @default(cuid())
+  provider  PaymentProvider
+  eventId   String
+  eventType String
+  status    WebhookStatus   @default(RECEIVED)
+  payload   Json
+  error     String?         @db.Text
+  attempts  Int             @default(0)
+
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  @@unique([provider, eventId])
+  @@index([status])
+  @@index([eventType])
+}
+
+// ----------------------------------------------------------------------------
+//  API platform - keys, rate limits, request logs
+// ----------------------------------------------------------------------------
+
+enum ApiKeyStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+model ApiKey {
+  id              String       @id @default(cuid())
+  userId          String
+  name            String
+  /// First 8 chars shown in UI, e.g. "sk_live_".
+  prefix          String
+  /// SHA-256(pepper + rawKey). The raw key is shown exactly once.
+  hashedKey       String       @unique
+  lastFour        String
+  scopes          String[]     @default([])
+  rateLimitPerMin Int          @default(120)
+  status          ApiKeyStatus @default(ACTIVE)
+
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  requestLogs ApiRequestLog[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model ApiRequestLog {
+  id         String   @id @default(cuid())
+  apiKeyId   String?
+  userId     String?
+  method     String
+  path       String
+  statusCode Int
+  durationMs Int
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  apiKey ApiKey? @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([apiKeyId, createdAt])
+  @@index([createdAt])
+  @@index([statusCode])
+}
+
+// ----------------------------------------------------------------------------
+//  Observability - audit, system logs, metrics, notifications
+// ----------------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actorEmail String?
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json     @default("{}")
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([actorId])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+enum LogLevel {
+  DEBUG
+  INFO
+  WARN
+  ERROR
+  FATAL
+}
+
+model SystemLog {
+  id        String   @id @default(cuid())
+  level     LogLevel @default(INFO)
+  source    String
+  message   String   @db.Text
+  context   Json     @default("{}")
+  requestId String?
+  createdAt DateTime @default(now())
+
+  @@index([level])
+  @@index([source])
+  @@index([createdAt])
+}
+
+/// Time-series samples for the System Health dashboard (latency, load, ...).
+model SystemMetric {
+  id         String   @id @default(cuid())
+  name       String
+  value      Float
+  unit       String
+  recordedAt DateTime @default(now())
+
+  @@index([name, recordedAt])
+}
+
+/// Pre-aggregated daily rollups powering the Analytics Engine charts.
+model DailyStat {
+  id   String   @id @default(cuid())
+  date DateTime @unique @db.Date
+
+  newUsers              Int    @default(0)
+  activeUsers           Int    @default(0)
+  newSubscriptions      Int    @default(0)
+  canceledSubscriptions Int    @default(0)
+  grossRevenueCents     BigInt @default(0)
+  refundedCents         BigInt @default(0)
+  mrrCents              BigInt @default(0)
+  activeSubscriptions   Int    @default(0)
+  churnedRevenueCents   BigInt @default(0)
+
+  @@index([date])
+}
+
+enum NotificationCategory {
+  BILLING
+  SECURITY
+  ORDERS
+  PRODUCT
+  SYSTEM
+  MARKETING
+}
+
+model Notification {
+  id        String               @id @default(cuid())
+  userId    String
+  category  NotificationCategory @default(SYSTEM)
+  title     String
+  body      String               @db.Text
+  href      String?
+  readAt    DateTime?
+  createdAt DateTime             @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([createdAt])
+}
+
+enum NotificationChannel {
+  EMAIL
+  IN_APP
+  WEBHOOK
+}
+
+model NotificationPreference {
+  id       String               @id @default(cuid())
+  userId   String
+  channel  NotificationChannel
+  category NotificationCategory
+  enabled  Boolean              @default(true)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, channel, category])
+  @@index([userId])
+}

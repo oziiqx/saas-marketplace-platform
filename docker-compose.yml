@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: saas_marketplace_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: saas
+      POSTGRES_PASSWORD: saas
+      POSTGRES_DB: saas_marketplace
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U saas -d saas_marketplace"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Optional: a browser-based Postgres client at http://localhost:8081
+  adminer:
+    image: adminer:5
+    container_name: saas_marketplace_adminer
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
